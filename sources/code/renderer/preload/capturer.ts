@@ -2,13 +2,6 @@ import { ipcRenderer as ipc } from "electron/renderer";
 import L10N from "../../common/modules/l10n";
 import type { AppConfig } from "../../main/modules/config";
 
-function translate(string:string):string {
-  const l10n = new L10N().client.dialog.screenShare.source;
-  return string
-    .replace("Entire Screen", l10n.entire)
-    .replace("Screen", l10n.screen);
-}
-
 function renderCapturerContainer(sources:Electron.DesktopCapturerSource[]) {
   const list = document.getElementById("capturer-list");
   if(list === null) throw new Error("Element of ID: 'capturer-list' does not exists!");
@@ -21,7 +14,7 @@ function renderCapturerContainer(sources:Electron.DesktopCapturerSource[]) {
     const button = document.createElement("button");
     button.className = "capturer-button";
     button.setAttribute("data-id", source.id);
-    button.setAttribute("title", translate(source.name));
+    button.setAttribute("title", source.name);
 
     // Thumbnail
     const thumbnail = document.createElement("img");
@@ -44,7 +37,7 @@ function renderCapturerContainer(sources:Electron.DesktopCapturerSource[]) {
     // Label
     const label = document.createElement("span");
     label.className = "capturer-label";
-    label.innerText = translate(source.name);
+    label.innerText = source.name;
     labelContainer.appendChild(label);
 
     button.appendChild(labelContainer);
@@ -53,7 +46,12 @@ function renderCapturerContainer(sources:Electron.DesktopCapturerSource[]) {
   }
 }
 
-type ExpectedIncomingResult = Electron.DesktopCapturerSource[];
+type ExpectedIncomingResult = [
+  /** List of sources fetched from the Electron API. */
+  sources: Electron.DesktopCapturerSource[],
+  /** Whenever audio has been enforced by command-line flags. */
+  screenShareAudio: boolean
+];
 
 const audioSupport = process.platform === "win32" || (
   process.platform !== "darwin" && Number(process.versions.electron.split(".")[0]) >= 29
@@ -88,11 +86,11 @@ window.addEventListener("DOMContentLoaded", () => {
           if(closeButton) closeButton.title = l10n.close;
         }
         try {
-          renderCapturerContainer(result);
+          renderCapturerContainer(result[0]);
           [...document.querySelectorAll(".capturer-button")].map(button =>
             button.addEventListener("click", () => {
               const bid = button.getAttribute("data-id");
-              const {id, name} = result.find(source => source.id === bid) ?? {};
+              const {id, name} = result[0].find(source => source.id === bid) ?? {};
               if (id === undefined || name === undefined) {
                 throw new Error('Source with id: "' + (id ?? "[null]") + '" does not exist!');
               }

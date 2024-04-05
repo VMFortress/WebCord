@@ -32,6 +32,7 @@ import { getBuildInfo } from "./modules/client";
 import { getRecommendedGPUFlags, getRecommendedOSFlags } from "../main/modules/optimize";
 import { styles } from "../main/modules/extensions";
 import { parseArgs, ParseArgsConfig, stripVTControlCharacters, debug } from "util";
+import cleanupURL from "./modules/urlTrack";
 
 const argvConfig = Object.freeze(({
   options: Object.freeze({
@@ -102,7 +103,21 @@ const argv = Object.freeze(parseArgs(argvConfig));
 /** Whenever `--start-minimized` or `-m` switch is used when running client. */
 let startHidden = false,
   /** Whenever WebCord starts in "Safe Mode". Default is `false`. */
-  safeMode = false;
+  safeMode = false,
+  /**
+   * Force enables screen share audio support. Disabled by the default.
+   *
+   * **Might bring undesirable consequences on unsupported platforms**.
+   */
+  screenShareAudio = false;
+
+import("node-pipewire").then((pw) => {
+  pw.createPwThread(argv.values.verbose === true);
+  screenShareAudio = true;
+}).catch(() => {
+  console.log("Error initializing pipewire, screen share audio will be disabled");
+});
+
 
 const userAgent: Partial<{
   replace: Parameters<typeof getUserAgent>[2];
@@ -350,7 +365,7 @@ function main(): void {
       checkVersion(updateInterval).catch(commonCatches.print);
     }, 30/*min*/*60000);
     checkVersion(updateInterval).catch(commonCatches.print);
-    const mainWindow = createMainWindow(startHidden);
+    const mainWindow = createMainWindow({startHidden, screenShareAudio});
     
     // WebSocket server
     import("../main/modules/socket.mjs")
@@ -412,7 +427,8 @@ app.on("web-contents-created", (_event, webContents) => {
   webContents.setWindowOpenHandler((details) => {
     const config = appConfig.value.settings;
     if (!app.isReady()) return { action: "deny" };
-    const openUrl = new URL(details.url);
+    const openUrl = cleanupURL(details.url);
+    details.url = openUrl.toString();
     const sameOrigin = new URL(webContents.getURL()).origin === openUrl.origin;
     const protocolMeta = { trust: false, allow: false };
 

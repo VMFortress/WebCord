@@ -108,8 +108,7 @@
                 "system": "Share with device audio."
             },
             "source": {
-                "entire": "Computer's screen",
-                "screen": "Screen"
+                "entire": "Open video source picker..."
             }
         }
     },

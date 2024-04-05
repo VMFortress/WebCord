@@ -26,13 +26,55 @@ import { commonCatches } from "../modules/error";
 import type { PartialRecursive } from "../../common/global";
 import { nativeImage } from "electron/common";
 import { satisfies as rSatisfies } from "semver";
+
+import { setupScreenShareWithPW } from "../../common/modules/node-pipewire-provider";
 import { existsSync } from "fs";
 
-type MainWindowFlags = [
-  startHidden: boolean
-];
+interface MainWindowFlags {
+  startHidden: boolean;
+  screenShareAudio: boolean;
+}
 
-export default function createMainWindow(...flags:MainWindowFlags): BrowserWindow {
+interface AudioInformation {
+  selectedAudioNodes: string[] | null;
+}
+
+const blacklistInputNodes: number[] = [];
+
+export default function createMainWindow(flags:MainWindowFlags): BrowserWindow {
+  
+  let pipewireAudio = false;
+  
+  import("node-pipewire").then((pw) => {
+    let testAudioAttempts = 0;
+    const testAudioInterval = setInterval(() => {
+      // get the actual input nodes from pipewire.
+      const inputNodes = pw.getInputNodes();
+    
+      if (inputNodes.length > 0) {
+        //If the user is using a chromium based browser, and is using a microphone, it will be in the list of input nodes.
+        const chromiumInputNodes = inputNodes.filter((node: { name: string }) => node.name === "Chromium");
+    
+        if (chromiumInputNodes.length > 0) {
+          chromiumInputNodes.forEach((node: { id: number }) => {
+            blacklistInputNodes.push(node.id);
+          });
+        }
+        flags.screenShareAudio = true;
+        pipewireAudio = true;
+        clearInterval(testAudioInterval);
+      } else{
+        testAudioAttempts++;
+        if (testAudioAttempts === 5) {
+          clearInterval(testAudioInterval);
+        }
+      }
+    }, 1000);
+  }).catch((error) => {
+    console.log("Error testing audio");
+    console.error(error);
+  });
+    
   const l10nStrings = new L10N().client;
 
   const internalWindowEvents = new EventEmitter();
@@ -87,11 +129,11 @@ export default function createMainWindow(...flags:MainWindowFlags): BrowserWindo
   });
   win.webContents.once("did-finish-load", () => {
     console.debug("[PAGE] Starting to load the Discord page...");
-    if (!flags[0]) win.show();
+    if (!flags.startHidden) win.show();
     setTimeout(() => {void win.loadURL(knownInstancesList[appConfig.value.settings.advanced.currentInstance.radio][1].href);}, 1500);
   });
   if (mainWindowState.initState.isMaximized)
-    if(!flags[0] || win.isVisible())
+    if(!flags.startHidden || win.isVisible())
       win.maximize();
     else
       win.once("show", () => win.maximize());
@@ -446,101 +488,191 @@ export default function createMainWindow(...flags:MainWindowFlags): BrowserWindo
    * Electron releases.
    */
   const apiSafe = Object.freeze({
-    capturer: rSatisfies(process.versions.electron,"<22.0.0 || >=26.0.0"),
+    capturer: rSatisfies(process.versions.electron,"<22.0.0"),
     unixAudioSharing: Number(process.versions.electron.split(".")[0])>=29
   });
 
-  /** Determines whenever another request to desktopCapturer is processed. */
-  let lock = false;
 
-  win.webContents.session.setDisplayMediaRequestHandler((req, callback) => {
-    const checkStatus =
-      // Handle lock and check for a presence of another BrowserView.
-      lock || win.getBrowserViews().length !== 0 ||
-      // Fail when client has denied the permission to the capturer.
-      (
-        appConfig.value.settings.privacy.permissions["display-capture"] &&
-        process.platform === "darwin" ?
-          systemPreferences.getMediaAccessStatus("screen") === "granted" :
-          true
-      ) ||
-      // Fail on different frame
-      req.frame.routingId !== win.webContents.mainFrame.routingId ||
-      // Whenever user is the one who most likely triggered this
-      req.userGesture;
-
-    if(!checkStatus) {
-      callback(null as unknown as Electron.Streams);
-      return;
-    }
-
-    lock = !app.commandLine.getSwitchValue("enable-features")
+  ipcMain.handle("getActualSources", async (_, params: {skipScreenSearch?: boolean}) => {
+    const lock = !app.commandLine.getSwitchValue("enable-features")
       .includes("WebRTCPipeWireCapturer") ||
       process.env["XDG_SESSION_TYPE"] !== "wayland" ||
       process.platform === "win32";
 
-    const sources = lock || apiSafe.capturer ?
-      // Use desktop capturer where it doesn't crash.
+    const skipScreenSearch = params.skipScreenSearch ?? false;
+  
+    const sources = !skipScreenSearch && (lock || apiSafe) ?
+    // Use desktop capturer on Electron 22 downwards or X11 systems
       desktopCapturer.getSources({
-        types: ["screen", "window"],
+        types: lock ? ["screen", "window"] : ["screen"],
         fetchWindowIcons: lock,
         thumbnailSize: lock ? {width: 150, height: 150 } : {width: 0, height: 0}
-      // Workaround #328: Segfault on `desktopCapturer.getSources()` since Electron 22
+        // Workaround #328: Segfault on `desktopCapturer.getSources()` since Electron 22
       }) : Promise.resolve([{
         id: "screen:1:0",
         appIcon: nativeImage.createEmpty(),
         display_id: "",
-        name: "Entire Screen",
+        name: "Screens",
+        thumbnail: nativeImage.createEmpty()
+      },
+      {
+        id: "window:1:0",
+        appIcon: nativeImage.createEmpty(),
+        display_id: "",
+        name: "Windows",
         thumbnail: nativeImage.createEmpty()
       } satisfies Electron.DesktopCapturerSource]);
-    if(lock) {
-      const view = new BrowserView({
-        webPreferences: {
-          preload: resolve(app.getAppPath(), "app/code/renderer/preload/capturer.js"),
-          nodeIntegration: false,
-          contextIsolation: true,
-          sandbox: false,
-          enableWebSQL: false,
-          webgl: false,
-          autoplayPolicy: "user-gesture-required"
-        }
-      });
-      ipcMain.handleOnce("getDesktopCapturerSources", async (event) => {
-        if(event.sender === view.webContents)
-          return await sources;
-        else
-          return null;
-      });
-      const autoResize = () => setImmediate(() => view.setBounds({
-        ...win.getBounds(),
-        x:0,
-        y:0,
-      }));
-      ipcMain.handleOnce("capturer-get-settings", () => {
-        return appConfig.value.screenShareStore;
-      });
-      ipcMain.once("closeCapturerView", (_event,data:Electron.Streams) => {
-        win.removeBrowserView(view);
-        view.webContents.delete();
-        win.removeListener("resize", autoResize);
-        ipcMain.removeHandler("capturer-get-settings");
-        callback(data);
-        lock = false;
-      });
-      win.setBrowserView(view);
-      void view.webContents.loadFile(resolve(app.getAppPath(), "sources/assets/web/html/capturer.html"));
-      view.webContents.once("did-finish-load", () => {
-        autoResize();
-        win.on("resize", autoResize);
-      });
-    } else void sources.then(sources => sources[0] ? callback({
-      video: sources[0],
-      ...(apiSafe.unixAudioSharing ? {audio:"loopbackWithMute"} : {})
-    }) : callback(null as unknown as Electron.Streams));
+
+    if(pipewireAudio) {
+      const pw = await import("node-pipewire");
+
+      const outputNodesName = pw.getOutputNodesName();
+
+      // Because Webcord is detected as 'Chromium', we need to remove it from the blacklist
+      const chromiumInputNodes = pw.getInputNodes().filter((node: { name: string; id: number }) => node.name.startsWith("Chromium") && !blacklistInputNodes.includes(node.id));
+      const newBlacklistInputNodes: number[] = chromiumInputNodes.map((node) => node.id);
+      blacklistInputNodes.push(...newBlacklistInputNodes);
+
+      // Filter outputNodesName to remove the repeated names
+      const outputNodesNameFiltered = outputNodesName.filter((node, index) => {
+        return outputNodesName.indexOf(node) === index;
+      }).sort();
+
+      return [await sources, flags.screenShareAudio, outputNodesNameFiltered];
+    }
+
+    return [await sources, flags.screenShareAudio];
   });
 
   // IPC events validated by secret "API" key and sender frame.
   internalWindowEvents.on("api", (safeApi:string) => {
+    /** Determines whenever another request to desktopCapturer is processed. */
+    let lock = false;
+    ipcMain.removeHandler("desktopCapturerRequest");
+    ipcMain.handle("desktopCapturerRequest", (event, api:unknown) => {
+      if(safeApi !== api || event.senderFrame.url !== win.webContents.getURL()) return;
+      return new Promise((resolvePromise) => {
+        // Handle lock and check for a presence of another BrowserView.
+        if(lock || win.getBrowserViews().length !== 0)
+          return new Error("Main process is busy by another request.");
+        // Fail when client has denied the permission to the capturer.
+        if(!appConfig.value.settings.privacy.permissions["display-capture"]) {
+          resolvePromise("Permission denied");
+          return;
+        }
+        lock = !app.commandLine.getSwitchValue("enable-features")
+          .includes("WebRTCPipeWireCapturer") ||
+          process.env["XDG_SESSION_TYPE"] !== "wayland" ||
+          process.platform === "win32";
+        
+        const sources = lock || apiSafe ?
+        // Use desktop capturer on Electron 22 downwards or X11 systems
+          desktopCapturer.getSources({
+            types: ["screen", "window"],
+            fetchWindowIcons: lock,
+            thumbnailSize: lock ? {width: 350, height: 350 } : {width: 0, height: 0}
+            // Workaround #328: Segfault on `desktopCapturer.getSources()` since Electron 22
+          }) : Promise.resolve([{
+            id: "screen:1:0",
+            appIcon: nativeImage.createEmpty(),
+            display_id: "",
+            name: "Screens",
+            thumbnail: nativeImage.createEmpty()
+          },
+          {
+            id: "window:1:0",
+            appIcon: nativeImage.createEmpty(),
+            display_id: "",
+            name: "Windows",
+            thumbnail: nativeImage.createEmpty()
+          } satisfies Electron.DesktopCapturerSource]);
+
+        let capturerJS = "app/code/renderer/preload/capturer.js";
+        let capturerHTML = "sources/assets/web/html/capturer.html";
+
+        if (pipewireAudio) {
+          capturerJS = "app/code/renderer/preload/pipewire-capturer.js";
+          capturerHTML = "sources/assets/web/html/pipewire-capturer.html";
+        }
+        
+        const view = new BrowserView({
+          webPreferences: {
+            preload: resolve(app.getAppPath(), capturerJS),
+            nodeIntegration: false,
+            contextIsolation: true,
+            sandbox: false,
+            enableWebSQL: false,
+            webgl: false,
+            autoplayPolicy: "user-gesture-required"
+          }
+        });
+        
+        if (!pipewireAudio){
+          ipcMain.handleOnce("getDesktopCapturerSources", async (event) => {
+            if(event.sender === view.webContents)
+              return [await sources, flags.screenShareAudio];
+            else
+              return null;
+          });
+        } else {
+          ipcMain.handleOnce("getDesktopCapturerSources", async (event) => {
+            const pw = await import("node-pipewire");
+            
+            const outputNodesName = pw.getOutputNodesName();
+
+            // Because Webcord is detected as 'Chromium', we need to remove it from the blacklist
+            const chromiumInputNodes = pw.getInputNodes().filter((node: { name: string; id: number }) => node.name.startsWith("Chromium") && !blacklistInputNodes.includes(node.id));
+            const newBlacklistInputNodes: number[] = chromiumInputNodes.map((node) => node.id);
+            blacklistInputNodes.push(...newBlacklistInputNodes);
+
+            // Filter outputNodesName to remove the repeated names
+            const outputNodesNameFiltered = outputNodesName.filter((node, index) => {
+              return outputNodesName.indexOf(node) === index;
+            }).sort();
+
+            if(event.sender === view.webContents)
+              return [await sources, flags.screenShareAudio, outputNodesNameFiltered];
+            else
+              return null;
+          });
+        }
+        const autoResize = () => setImmediate(() => view.setBounds({
+          ...win.getBounds(),
+          x:0,
+          y:0,
+        }));
+        ipcMain.handleOnce("capturer-get-settings", () => {
+          return appConfig.value.screenShareStore;
+        });
+        ipcMain.once("closeCapturerView", (_event, data: unknown, audioInfo?: AudioInformation) => {
+          win.removeBrowserView(view);
+          view.webContents.delete();
+          win.removeListener("resize", autoResize);
+          ipcMain.removeHandler("capturer-get-settings");
+
+
+          if(audioInfo?.selectedAudioNodes){
+            const selectedAudioNodes = audioInfo.selectedAudioNodes;
+
+            if (selectedAudioNodes.length > 0) {
+              setupScreenShareWithPW(selectedAudioNodes).catch((error) => {
+                console.error(error);
+              });
+            }
+          }
+        
+          resolvePromise(data);
+          lock = false;
+        });
+        win.setBrowserView(view);
+        void view.webContents.loadFile(resolve(app.getAppPath(), capturerHTML));
+        view.webContents.once("did-finish-load", () => {
+          autoResize();
+          win.on("resize", autoResize);
+        });
+        return;
+      });
+    });
     ipcMain.removeAllListeners("paste-workaround");
     ipcMain.on("paste-workaround", (event, api:unknown) => {
       if(safeApi !== api || event.senderFrame.url !== win.webContents.getURL()) return;
